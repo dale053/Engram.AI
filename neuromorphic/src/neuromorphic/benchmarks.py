@@ -667,6 +667,59 @@ def nearest_centroid_loo_accuracy(
     return loo_correct / n_samples
 
 
+def layer_separability_metrics(mat: np.ndarray, labels_arr: np.ndarray) -> dict[str, float]:
+    """Silhouette score + nearest-centroid linear-probe accuracy for one
+    layer's per-pattern spike-count vectors.
+
+    Shared by ConceptSeparabilityBenchmark and FeatureHierarchyBenchmark (issue
+    #320) so every layer in a hierarchy is scored with identical,
+    sklearn-verified math (see silhouette_scores_from_distance_matrix and
+    nearest_centroid_loo_accuracy above, verified in scripts/verify_silhouette_score.py,
+    issue #330) — a fair comparison requires the same metric, not just the
+    same-shaped one recomputed per layer.
+    """
+    norms = np.linalg.norm(mat, axis=1, keepdims=True)
+    norms[norms == 0] = 1.0
+    mat_unit = mat / norms
+
+    # Cosine distance matrix: D[i,j] = 1 − cos_similarity
+    sim = mat_unit @ mat_unit.T
+    dist = np.clip(1.0 - sim, 0.0, 2.0).astype(np.float64)
+    np.fill_diagonal(dist, 0.0)
+
+    sil_scores = silhouette_scores_from_distance_matrix(dist, labels_arr)
+    silhouette = round(float(np.mean(sil_scores)), 4)
+
+    n_samples = mat.shape[0]
+    intra: list[float] = []
+    inter: list[float] = []
+    for i in range(n_samples):
+        same_mask = labels_arr == labels_arr[i]
+        same_mask_excl = same_mask.copy()
+        same_mask_excl[i] = False
+        if same_mask_excl.any():
+            intra.extend(dist[i, same_mask_excl].tolist())
+        other_mask = ~same_mask
+        if other_mask.any():
+            inter.extend(dist[i, other_mask].tolist())
+
+    raw_intra = float(np.mean(intra)) if intra else 0.0
+    raw_inter = float(np.mean(inter)) if inter else 0.0
+    mean_intra = round(raw_intra, 4)
+    mean_inter = round(raw_inter, 4)
+    separation_ratio = round(raw_inter / (raw_intra + 1e-8), 4)
+
+    accuracy = round(nearest_centroid_loo_accuracy(mat_unit, labels_arr), 4)
+
+    return {
+        "silhouette_score": silhouette,
+        "linear_probe_accuracy": accuracy,
+        "mean_intra_class_distance": mean_intra,
+        "mean_inter_class_distance": mean_inter,
+        "separation_ratio": separation_ratio,
+    }
+
+
 class ConceptSeparabilityBenchmark:
     """Score how well concept-layer activations separate distinct stimuli.
 
@@ -738,44 +791,11 @@ class ConceptSeparabilityBenchmark:
             }
 
         mat = np.array(vecs, dtype=np.float32)  # (n_samples, concept_n)
+        metrics = layer_separability_metrics(mat, labels_arr)
 
-        # L2-normalise rows for cosine distance
-        norms = np.linalg.norm(mat, axis=1, keepdims=True)
-        norms[norms == 0] = 1.0
-        mat_unit = mat / norms
-
-        # Cosine distance matrix: D[i,j] = 1 − cos_similarity
-        sim = mat_unit @ mat_unit.T
-        dist = np.clip(1.0 - sim, 0.0, 2.0).astype(np.float64)
-        np.fill_diagonal(dist, 0.0)
-
-        # Silhouette score (pure NumPy)
-        sil_scores = silhouette_scores_from_distance_matrix(dist, labels_arr)
-        silhouette = round(float(np.mean(sil_scores)), 4)
-
-        # Mean intra / inter class cosine distances
-        intra: list[float] = []
-        inter: list[float] = []
-        for i in range(n_samples):
-            same_mask = labels_arr == labels_arr[i]
-            same_mask_excl = same_mask.copy()
-            same_mask_excl[i] = False
-            if same_mask_excl.any():
-                intra.extend(dist[i, same_mask_excl].tolist())
-            other_mask = ~same_mask
-            if other_mask.any():
-                inter.extend(dist[i, other_mask].tolist())
-
-        raw_intra = float(np.mean(intra)) if intra else 0.0
-        raw_inter = float(np.mean(inter)) if inter else 0.0
-        mean_intra = round(raw_intra, 4)
-        mean_inter = round(raw_inter, 4)
-        separation_ratio = round(raw_inter / (raw_intra + 1e-8), 4)
-
-        # Leave-one-out nearest-centroid linear probe (no sklearn, unbiased)
-        accuracy = round(nearest_centroid_loo_accuracy(mat_unit, labels_arr), 4)
-
-        # Top concept neurons per pattern (most selective on average)
+        # Top concept neurons per pattern (most selective on average) — uses
+        # raw (non-unit-normalized) firing rates, so this stays local rather
+        # than folding into the shared layer_separability_metrics() helper.
         raw_centroids = np.array(
             [mat[labels_arr == lbl].mean(axis=0) for lbl in unique_labels],
             dtype=np.float32,
@@ -783,11 +803,7 @@ class ConceptSeparabilityBenchmark:
         top_neurons = [np.argsort(row)[-5:][::-1].tolist() for row in raw_centroids]
 
         return {
-            "silhouette_score": silhouette,
-            "linear_probe_accuracy": accuracy,
-            "mean_intra_class_distance": mean_intra,
-            "mean_inter_class_distance": mean_inter,
-            "separation_ratio": separation_ratio,
+            **metrics,
             "n_patterns": len(patterns),
             "n_samples": n_samples,
             "concept_neurons": int(net.concept.n),
@@ -795,6 +811,181 @@ class ConceptSeparabilityBenchmark:
             "training_reps": training_reps,
             "probe_reps": probe_reps,
         }
+
+
+# ---------------------------------------------------------------------------
+# Feature-hierarchy audit (issue #320) — not one of the 6 BenchmarkSuite
+# benchmarks; a standalone diagnostic run separately (see
+# scripts/audit_feature_hierarchy.py), same pattern as
+# scripts/verify_silhouette_score.py (issue #330).
+# ---------------------------------------------------------------------------
+class FeatureHierarchyBenchmark:
+    """Does FeatureLayer measurably improve separability before ConceptLayer
+    processes it, or is the "hierarchy" nominal rather than functional?
+
+    ConceptSeparabilityBenchmark only measures the end result at the concept
+    layer — it can't tell whether that separability was inherited almost
+    entirely from ConceptLayer's own k-WTA bottleneck, or whether FeatureLayer
+    already did meaningful work upstream. This trains the same way
+    ConceptSeparabilityBenchmark does, then probes sensory, feature, and
+    concept spikes *simultaneously* during the same passes, so all three
+    scores come from the exact same trained network and stimulus set — a
+    fair, single-run comparison rather than three separate benchmark runs
+    that could drift apart from independent STDP noise.
+
+    Metrics returned, per available layer ("sensory", "feature", "concept"):
+    same shape as ConceptSeparabilityBenchmark's silhouette_score /
+    linear_probe_accuracy / mean_intra_class_distance /
+    mean_inter_class_distance / separation_ratio (layer_separability_metrics()
+    is the exact function both call). Plus the deltas the issue's acceptance
+    criteria ask for: feature_vs_sensory_*_delta (is FeatureLayer's output
+    better separated than raw sensory input?) and, when a concept layer is
+    also present, concept_vs_feature_*_delta (does ConceptLayer add further
+    separation on top of FeatureLayer, or was FeatureLayer already doing all
+    the work?).
+    """
+
+    def __init__(self, net: NeuromorphicNetwork) -> None:
+        self._net = net
+
+    def run(
+        self,
+        patterns: list[dict],
+        training_reps: int = 5,
+        probe_reps: int = 3,
+        steps_per_rep: int = 10,
+    ) -> dict[str, Any]:
+        net = self._net
+        if net.feature is None:
+            return {
+                "error": "no feature layer (NEURO_FEATURE_N=0)",
+                "n_patterns": len(patterns),
+            }
+
+        # Training phase — identical to ConceptSeparabilityBenchmark, so the
+        # comparison isn't confounded by a different training regime.
+        for _ in range(training_reps):
+            for pat in patterns:
+                c = net.inject_observation(pat["visual"], provenance="sensor.videofile.bench")
+                for _ in range(steps_per_rep):
+                    net.step(c)
+                    c = c * np.float32(0.97)
+
+        # Probe phase — accumulate sensory/feature/concept spike vectors
+        # together so every layer sees the exact same stimulus presentation.
+        labels: list[int] = []
+        sensory_vecs: list[np.ndarray] = []
+        feature_vecs: list[np.ndarray] = []
+        concept_vecs: list[np.ndarray] | None = [] if net.concept is not None else None
+
+        for idx, pat in enumerate(patterns):
+            for _ in range(probe_reps):
+                sensory_acc = np.zeros(net.sensory.n, dtype=np.float32)
+                feature_acc = np.zeros(net.feature.n, dtype=np.float32)
+                concept_acc = (
+                    np.zeros(net.concept.n, dtype=np.float32) if net.concept is not None else None
+                )
+                c = net.inject_observation(pat["visual"], provenance="sensor.videofile.bench")
+                for _ in range(steps_per_rep):
+                    net.step(c)
+                    c = c * np.float32(0.97)
+                    sensory_acc += net.sensory.spikes.astype(np.float32)
+                    feature_acc += net.feature.spikes.astype(np.float32)
+                    if concept_acc is not None:
+                        concept_acc += net.concept.spikes.astype(np.float32)
+                labels.append(idx)
+                sensory_vecs.append(sensory_acc)
+                feature_vecs.append(feature_acc)
+                if concept_acc is not None:
+                    concept_vecs.append(concept_acc)
+
+        labels_arr = np.array(labels, dtype=np.int32)
+        n_samples = len(labels)
+        n_classes = len(np.unique(labels_arr))
+        if n_classes < 2 or n_samples < 4:
+            return {
+                "error": "insufficient patterns for separability",
+                "n_patterns": len(patterns),
+            }
+
+        sensory_mat = np.array(sensory_vecs, dtype=np.float32)
+        feature_mat = np.array(feature_vecs, dtype=np.float32)
+        concept_mat = np.array(concept_vecs, dtype=np.float32) if concept_vecs is not None else None
+
+        sensory_metrics = layer_separability_metrics(sensory_mat, labels_arr)
+        feature_metrics = layer_separability_metrics(feature_mat, labels_arr)
+        concept_metrics = (
+            layer_separability_metrics(concept_mat, labels_arr) if concept_mat is not None else None
+        )
+
+        # A layer that never spiked during probing has an all-zero vector for
+        # every pattern, which trivially collapses every distance to 0 and
+        # every silhouette score to 0 -- indistinguishable, by the numbers
+        # alone, from "fires the same way for every stimulus." Flag it
+        # explicitly so a silent layer is never misread as "no hierarchical
+        # improvement": that would attribute a training/drive problem to the
+        # architecture, which is a different (and much less interesting)
+        # finding than the one this benchmark is trying to surface.
+        feature_active = bool(np.any(feature_mat > 0))
+        concept_active = bool(np.any(concept_mat > 0)) if concept_mat is not None else None
+
+        result: dict[str, Any] = {
+            "sensory": {**sensory_metrics, "n_neurons": int(net.sensory.n)},
+            "feature": {
+                **feature_metrics,
+                "n_neurons": int(net.feature.n),
+                "active": feature_active,
+            },
+            "concept": (
+                {**concept_metrics, "n_neurons": int(net.concept.n), "active": concept_active}
+                if concept_metrics is not None
+                else None
+            ),
+            "feature_vs_sensory_silhouette_delta": round(
+                feature_metrics["silhouette_score"] - sensory_metrics["silhouette_score"], 4
+            ),
+            "feature_vs_sensory_accuracy_delta": round(
+                feature_metrics["linear_probe_accuracy"] - sensory_metrics["linear_probe_accuracy"],
+                4,
+            ),
+            "n_patterns": len(patterns),
+            "n_samples": n_samples,
+            "training_reps": training_reps,
+            "probe_reps": probe_reps,
+        }
+        if concept_metrics is not None:
+            result["concept_vs_feature_silhouette_delta"] = round(
+                concept_metrics["silhouette_score"] - feature_metrics["silhouette_score"], 4
+            )
+            result["concept_vs_feature_accuracy_delta"] = round(
+                concept_metrics["linear_probe_accuracy"] - feature_metrics["linear_probe_accuracy"],
+                4,
+            )
+        if not feature_active:
+            # No conclusion is possible: an all-zero FeatureLayer output loses
+            # every comparison trivially, which would misreport "insufficient
+            # drive to activate this layer in this run" as "the hierarchy is
+            # nominal" -- a materially different and much less interesting
+            # finding. None (not False) signals "couldn't measure," not "no."
+            result["feature_layer_improves_on_sensory"] = None
+            result["inconclusive_reason"] = (
+                "feature layer produced zero spikes during probing — increase "
+                "training_reps/steps_per_rep or network scale before drawing "
+                "a hierarchy conclusion from this run"
+            )
+        else:
+            # A functional hierarchy requires FeatureLayer to measurably improve
+            # on raw sensory separability on both metrics — if it doesn't, per
+            # the issue, "the hierarchy is nominal rather than functional" at
+            # this boundary. Deliberately a strict AND, not "either metric": a
+            # single improved metric could be noise, and this is a research
+            # verdict, not a pass/fail gate, so it should err toward the
+            # uncomfortable answer rather than a generous one.
+            result["feature_layer_improves_on_sensory"] = (
+                result["feature_vs_sensory_silhouette_delta"] > 0
+                and result["feature_vs_sensory_accuracy_delta"] > 0
+            )
+        return result
 
 
 # ---------------------------------------------------------------------------

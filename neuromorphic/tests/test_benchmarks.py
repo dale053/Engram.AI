@@ -16,6 +16,7 @@ from neuromorphic.benchmarks import (
     ConceptSeparabilityBenchmark,
     CrossModalRecallBenchmark,
     EnergyEfficiencyBenchmark,
+    FeatureHierarchyBenchmark,
     NoveltyDetectionBenchmark,
     RegionQuietFlag,
     _confidence_interval,
@@ -25,6 +26,7 @@ from neuromorphic.benchmarks import (
     classify_quiet_regions,
     format_quiet_region_report,
     generate_test_patterns,
+    layer_separability_metrics,
     nearest_centroid_loo_accuracy,
     silhouette_scores_from_distance_matrix,
 )
@@ -509,6 +511,50 @@ def network_with_concept():
     return NeuromorphicNetwork(cfg)
 
 
+@pytest.fixture
+def network_with_feature_and_concept():
+    """Small network with both FeatureLayer and ConceptLayer active (issue #320).
+
+    Both default to 0/disabled in NeuromorphicConfig.from_env() — this
+    fixture is what network_with_concept would need to add to actually
+    exercise the FeatureLayer -> ConceptLayer hierarchy at all.
+    """
+    cfg = NeuromorphicConfig.from_env()
+    cfg.populations.brainstem = 50
+    cfg.populations.reflex_arc = 30
+    cfg.populations.sensory_cortex = 200
+    cfg.populations.motor_cortex = 100
+    cfg.populations.cerebellum = 50
+    cfg.populations.association_cortex = 150
+    cfg.populations.predictive_layer = 80
+    cfg.populations.working_memory = 40
+    cfg.populations.feature_layer = 120
+    cfg.populations.concept_layer = 100
+    cfg.populations.pattern_separator = 0
+    cfg.populations.meta_controller = 0
+    cfg.concept_layer.k_winners = 10  # 10% sparsity for meaningful k-WTA
+    return NeuromorphicNetwork(cfg)
+
+
+@pytest.fixture
+def network_with_feature_only():
+    """Small network with FeatureLayer active but ConceptLayer disabled."""
+    cfg = NeuromorphicConfig.from_env()
+    cfg.populations.brainstem = 50
+    cfg.populations.reflex_arc = 30
+    cfg.populations.sensory_cortex = 200
+    cfg.populations.motor_cortex = 100
+    cfg.populations.cerebellum = 50
+    cfg.populations.association_cortex = 150
+    cfg.populations.predictive_layer = 80
+    cfg.populations.working_memory = 40
+    cfg.populations.feature_layer = 120
+    cfg.populations.concept_layer = 0
+    cfg.populations.pattern_separator = 0
+    cfg.populations.meta_controller = 0
+    return NeuromorphicNetwork(cfg)
+
+
 class TestConceptSeparabilityBenchmark:
 
     def test_no_concept_layer_returns_error(self, small_network, patterns):
@@ -597,6 +643,145 @@ class TestConceptSeparabilityBenchmark:
         text = suite.summary(results)
         assert "Concept Separability" in text
         assert "Silhouette score" in text
+
+
+class TestLayerSeparabilityMetrics:
+    """Direct tests for the shared helper (issue #320) on synthetic data —
+    covers the "layer is genuinely active" path that a fast, small-scale
+    NeuromorphicNetwork often can't reach within a short training window
+    (see TestFeatureHierarchyBenchmark's inconclusive-path tests below)."""
+
+    def test_well_separated_clusters_score_high(self):
+        rng = np.random.default_rng(0)
+        mat = np.concatenate(
+            [
+                rng.normal(0, 0.1, size=(4, 8)) + np.array([5.0] * 8),
+                rng.normal(0, 0.1, size=(4, 8)) + np.array([-5.0] * 8),
+            ]
+        ).astype(np.float32)
+        labels = np.array([0] * 4 + [1] * 4, dtype=np.int32)
+        metrics = layer_separability_metrics(mat, labels)
+        assert metrics["silhouette_score"] > 0.5
+        assert metrics["linear_probe_accuracy"] == 1.0
+        assert metrics["separation_ratio"] > 1.0
+
+    def test_all_zero_matrix_scores_neutral_not_perfect(self):
+        """An inactive layer (all-zero vectors) must score as neutral/can't-tell
+        (silhouette 0), never as perfectly separated. Every off-diagonal cosine
+        distance collapses to exactly 1.0 (0/0 similarity, via the
+        norms[norms==0]=1.0 fallback) since intra- and inter-class distances
+        are indistinguishable when nothing fired -- not 0.0, which would read
+        as identical, the opposite of neutral.
+        """
+        mat = np.zeros((8, 10), dtype=np.float32)
+        labels = np.array([0, 0, 1, 1, 2, 2, 3, 3], dtype=np.int32)
+        metrics = layer_separability_metrics(mat, labels)
+        assert metrics["silhouette_score"] == 0.0
+        assert metrics["mean_intra_class_distance"] == 1.0
+        assert metrics["mean_inter_class_distance"] == 1.0
+        assert metrics["separation_ratio"] == pytest.approx(1.0, abs=1e-4)
+
+    def test_identical_vectors_across_all_classes_score_zero_silhouette(self):
+        mat = np.ones((6, 5), dtype=np.float32)
+        labels = np.array([0, 0, 1, 1, 2, 2], dtype=np.int32)
+        metrics = layer_separability_metrics(mat, labels)
+        assert metrics["silhouette_score"] == 0.0
+
+    def test_matches_concept_separability_benchmark_math(self, network_with_concept, patterns):
+        """The refactor that extracted this helper must not change
+        ConceptSeparabilityBenchmark's own output — same inputs, same numbers."""
+        bench = ConceptSeparabilityBenchmark(network_with_concept)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        # Every key layer_separability_metrics() returns must appear unchanged
+        # in ConceptSeparabilityBenchmark's own result dict.
+        for key in (
+            "silhouette_score",
+            "linear_probe_accuracy",
+            "mean_intra_class_distance",
+            "mean_inter_class_distance",
+            "separation_ratio",
+        ):
+            assert key in result
+
+
+class TestFeatureHierarchyBenchmark:
+    """Tests for the FeatureLayer -> ConceptLayer separability audit (issue #320)."""
+
+    def test_no_feature_layer_returns_error(self, small_network, patterns):
+        bench = FeatureHierarchyBenchmark(small_network)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" in result
+        assert "feature" in result["error"]
+
+    def test_insufficient_patterns_returns_error(self, network_with_feature_and_concept):
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        one_pattern = generate_test_patterns(1, np.random.default_rng(42))
+        result = bench.run(one_pattern, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" in result
+
+    def test_produces_sensory_and_feature_keys(self, network_with_feature_and_concept, patterns):
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        assert result["sensory"] is not None
+        assert result["feature"] is not None
+        assert "silhouette_score" in result["sensory"]
+        assert "silhouette_score" in result["feature"]
+        assert "active" in result["feature"]
+        assert "feature_vs_sensory_silhouette_delta" in result
+        assert "feature_vs_sensory_accuracy_delta" in result
+        assert "feature_layer_improves_on_sensory" in result
+
+    def test_concept_absent_when_disabled(self, network_with_feature_only, patterns):
+        bench = FeatureHierarchyBenchmark(network_with_feature_only)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        assert result["concept"] is None
+        assert "concept_vs_feature_silhouette_delta" not in result
+        assert "concept_vs_feature_accuracy_delta" not in result
+
+    def test_concept_present_when_enabled(self, network_with_feature_and_concept, patterns):
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        assert result["concept"] is not None
+        assert "concept_vs_feature_silhouette_delta" in result
+        assert "concept_vs_feature_accuracy_delta" in result
+
+    def test_inconclusive_when_feature_layer_silent(
+        self, network_with_feature_and_concept, patterns
+    ):
+        """A short/small-scale run — verified empirically to leave FeatureLayer
+        silent — must report None (inconclusive), not a real True/False verdict
+        that would misattribute "no drive reached this layer" to "the hierarchy
+        adds nothing" (issue #320's core methodological risk)."""
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        assert result["feature"]["active"] is False
+        assert result["feature_layer_improves_on_sensory"] is None
+        assert "inconclusive_reason" in result
+
+    def test_scores_in_range(self, network_with_feature_and_concept, patterns):
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        result = bench.run(patterns, training_reps=1, probe_reps=2, steps_per_rep=3)
+        assert "error" not in result
+        for layer_name in ("sensory", "feature", "concept"):
+            layer = result[layer_name]
+            assert -1.0 <= layer["silhouette_score"] <= 1.0
+            assert 0.0 <= layer["linear_probe_accuracy"] <= 1.0
+            assert layer["mean_intra_class_distance"] >= 0.0
+            assert layer["mean_inter_class_distance"] >= 0.0
+            assert layer["separation_ratio"] >= 0.0
+
+    def test_sample_count_matches(self, network_with_feature_and_concept, patterns):
+        bench = FeatureHierarchyBenchmark(network_with_feature_and_concept)
+        probe_reps = 2
+        result = bench.run(patterns, training_reps=1, probe_reps=probe_reps, steps_per_rep=3)
+        assert "error" not in result
+        assert result["n_samples"] == len(patterns) * probe_reps
+        assert result["n_patterns"] == len(patterns)
 
 
 def _cosine_dist(mat: np.ndarray) -> np.ndarray:
